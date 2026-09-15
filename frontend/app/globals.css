@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+:root { --ink: #17212b; --muted: #687581; --line: #dfe5e8; --paper: #f7f8f6; --accent: #b45f3b; }
+* { box-sizing: border-box; } body { margin: 0; color: var(--ink); background: var(--paper); font-family: Arial, Helvetica, sans-serif; } button, textarea { font: inherit; }
+.grain { background-image: radial-gradient(#d7d0c8 0.45px, transparent 0.45px); background-size: 7px 7px; }
+.label { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; }
+.section-title { margin-top: 6px; font-family: Georgia, 'Times New Roman', serif; font-size: 25px; letter-spacing: -.02em; }
