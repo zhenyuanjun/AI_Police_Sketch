@@ -1,17 +1,23 @@
 import os
+from pathlib import Path
+import logging
 from typing import Dict
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
 from app.schemas.sketches import GenerateSketchRequest, RefineSketchRequest, SketchResponse
 from app.services.sketch_generation import OpenAISketchGenerationService, MockSketchGenerationService, SketchGenerationService
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Police Sketch API", version="0.1.0")
 origins = [os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 def create_generation_service() -> SketchGenerationService:
     provider = os.getenv("SKETCH_PROVIDER", "mock").strip().lower()
+    logger.info("Sketch provider: %s", provider)
     if provider == "mock":
         return MockSketchGenerationService()
     if provider == "openai":
