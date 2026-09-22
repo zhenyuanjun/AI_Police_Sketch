@@ -69,6 +69,8 @@ def refine_sketch(sketch_id: str, request: RefineSketchRequest) -> SketchRespons
         sketch = service.refine(sketch_id, request.instruction)
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if sketch is None:
         raise HTTPException(status_code=404, detail="Sketch not found")
     return response_from_sketch(sketch)
