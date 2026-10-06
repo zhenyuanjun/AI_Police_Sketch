@@ -6,6 +6,8 @@ import os
 from typing import Dict, Optional
 from uuid import uuid4
 
+from app.services.image_storage import LocalSketchImageStorage
+
 
 @dataclass
 class Sketch:
@@ -14,17 +16,18 @@ class Sketch:
     description: str
     refinement_instruction: Optional[str] = None
     image_url: Optional[str] = None
+    witness_age: Optional[float] = None
 
 
 class SketchGenerationService(ABC):
     @abstractmethod
-    def generate(self, description: str) -> Sketch: ...
-
-    @abstractmethod
-    def generate_from_reference(self, filename: str, content_type: str, image_bytes: bytes) -> Sketch: ...
+    def generate(self, description: str, witness_age: Optional[float] = None) -> Sketch: ...
 
     @abstractmethod
     def refine(self, sketch_id: str, instruction: str) -> Optional[Sketch]: ...
+
+    @abstractmethod
+    def get_image_bytes(self, sketch_id: str) -> Optional[bytes]: ...
 
 
 class MockSketchGenerationService(SketchGenerationService):
@@ -33,15 +36,8 @@ class MockSketchGenerationService(SketchGenerationService):
     def __init__(self) -> None:
         self._sketches: Dict[str, Sketch] = {}
 
-    def generate(self, description: str) -> Sketch:
-        sketch = Sketch(id=str(uuid4()), version=1, description=description.strip())
-        self._sketches[sketch.id] = sketch
-        return sketch
-
-    def generate_from_reference(self, filename: str, content_type: str, image_bytes: bytes) -> Sketch:
-        # The bytes are inspected only for this request and are never written to disk.
-        description = "Reference image upload: {} ({})".format(filename, content_type)
-        sketch = Sketch(id=str(uuid4()), version=1, description=description)
+    def generate(self, description: str, witness_age: Optional[float] = None) -> Sketch:
+        sketch = Sketch(id=str(uuid4()), version=1, description=description.strip(), witness_age=witness_age)
         self._sketches[sketch.id] = sketch
         return sketch
 
@@ -54,9 +50,13 @@ class MockSketchGenerationService(SketchGenerationService):
             version=current.version + 1,
             description=current.description,
             refinement_instruction=instruction.strip(),
+            witness_age=current.witness_age,
         )
         self._sketches[sketch_id] = refined
         return refined
+
+    def get_image_bytes(self, sketch_id: str) -> Optional[bytes]:
+        return None
 
 
 class OpenAISketchGenerationService(SketchGenerationService):
@@ -71,6 +71,7 @@ class OpenAISketchGenerationService(SketchGenerationService):
         self._client = OpenAI(api_key=api_key) if api_key else None
         self._sketches: Dict[str, Sketch] = {}
         self._image_bytes: Dict[str, bytes] = {}
+        self._image_storage = LocalSketchImageStorage()
 
     @staticmethod
     def _image_from_response(result) -> tuple[str, bytes]:
@@ -85,7 +86,7 @@ class OpenAISketchGenerationService(SketchGenerationService):
             raise RuntimeError("OpenAI returned an empty image.")
         return f"data:image/png;base64,{image_data}", image_bytes
 
-    def generate(self, description: str) -> Sketch:
+    def generate(self, description: str, witness_age: Optional[float] = None) -> Sketch:
         cleaned_description = description.strip()
         if not cleaned_description:
             raise ValueError("A witness description is required.")
@@ -106,13 +107,18 @@ class OpenAISketchGenerationService(SketchGenerationService):
         except Exception as exc:
             raise RuntimeError("OpenAI image generation failed. Check the backend logs for details.") from exc
         image_url, image_bytes = self._image_from_response(result)
-        sketch = Sketch(id=str(uuid4()), version=1, description=cleaned_description, image_url=image_url)
+        sketch = Sketch(id=str(uuid4()), version=1, description=cleaned_description, image_url=image_url, witness_age=witness_age)
         self._sketches[sketch.id] = sketch
         self._image_bytes[sketch.id] = image_bytes
+        self._image_storage.save(
+            sketch.id,
+            sketch.version,
+            image_bytes,
+            "initial",
+            description=sketch.description,
+            witness_age=witness_age,
+        )
         return sketch
-
-    def generate_from_reference(self, filename: str, content_type: str, image_bytes: bytes) -> Sketch:
-        raise NotImplementedError("Reference-image generation is not available in OpenAI Phase 2A.")
 
     def refine(self, sketch_id: str, instruction: str) -> Optional[Sketch]:
         cleaned_instruction = instruction.strip()
@@ -122,6 +128,18 @@ class OpenAISketchGenerationService(SketchGenerationService):
             raise ValueError("OPENAI_API_KEY is required when SKETCH_PROVIDER=openai.")
         current = self._sketches.get(sketch_id)
         image_bytes = self._image_bytes.get(sketch_id)
+        if image_bytes is None:
+            image_bytes = self._image_storage.load_latest(sketch_id)
+        if current is None:
+            metadata = self._image_storage.get_latest_version_metadata(sketch_id)
+            if metadata is not None:
+                current = Sketch(
+                    id=sketch_id,
+                    version=metadata["version"],
+                    description=metadata.get("description", ""),
+                    refinement_instruction=metadata.get("refinement_instruction"),
+                    witness_age=self._image_storage.get_witness_age(sketch_id),
+                )
         if current is None or image_bytes is None:
             raise ValueError("No generated image is available to refine.")
 
@@ -147,7 +165,21 @@ class OpenAISketchGenerationService(SketchGenerationService):
             description=current.description,
             refinement_instruction=cleaned_instruction,
             image_url=image_url,
+            witness_age=current.witness_age,
         )
         self._sketches[sketch_id] = refined
         self._image_bytes[sketch_id] = edited_image_bytes
+        self._image_storage.save(
+            refined.id,
+            refined.version,
+            edited_image_bytes,
+            "refinement",
+            description=refined.description or None,
+            refinement_instruction=refined.refinement_instruction,
+            parent_version=current.version,
+        )
         return refined
+
+    def get_image_bytes(self, sketch_id: str) -> Optional[bytes]:
+        persisted = self._image_storage.load_latest(sketch_id)
+        return persisted if persisted is not None else self._image_bytes.get(sketch_id)
