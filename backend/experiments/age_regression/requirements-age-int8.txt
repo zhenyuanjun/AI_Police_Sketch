@@ -1,0 +1,8 @@
+# AGE-4B.1 FP32 LiteRT export baseline; isolated from AGE training requirements.
+# Python 3.11. The package set matches the successful CSE593 reference versions;
+# dependency resolution and import checks are recorded in the AGE-4B.1 report.
+torch==2.13.0
+torchvision==0.28.0
+litert-torch==0.9.4
+ai-edge-litert==2.2.0
+numpy==2.3.3

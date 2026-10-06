@@ -2,3 +2,12 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.5
 python-multipart==0.0.20
+# AGE LiteRT exports install xdsl==0.28.0, which requires typing-extensions<4.13.
+# OpenAI 1.109.1 accepts the locked AGE runtime version below; newer OpenAI 3.x
+# requires typing-extensions>=4.14 and breaks that resolver constraint.
+openai==1.109.1
+typing-extensions==4.12.2
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+torch>=2.2.0
+torchvision>=0.17.0

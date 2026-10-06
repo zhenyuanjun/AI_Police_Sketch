@@ -9,9 +9,34 @@ out/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-*/
 venv/
+backend/.venv-3ddfa/
+backend/.venv-age/
+backend/.venv-age-int8/
+backend/experiments/vendor/3DDFA_V2/
 .pytest_cache/
 .idea/
 .vscode/
+
+backend/data/generated_sketches/*.png
+backend/data/generated_sketches/*.json
+backend/data/models/*
+!backend/data/models/.gitkeep
+backend/data/face_landmark_experiments/*
+!backend/data/face_landmark_experiments/.gitkeep
+
+# Local AgeDB data and generated metadata / future training artifacts
+AgeDB/
+agedb/
+backend/data/agedb/
+backend/experiments/age_regression/output/
+backend/experiments/age_regression/output/age4b1_litert/
+backend/experiments/age_regression/checkpoints/
+backend/experiments/age_regression/runs/
+*.pt
+*.pth
+*.onnx
+*.tflite
 
 *.tsbuildinfo
