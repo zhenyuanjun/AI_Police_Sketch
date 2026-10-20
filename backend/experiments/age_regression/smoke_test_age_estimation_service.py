@@ -32,6 +32,8 @@ from app.services.age_estimation_service import (  # noqa: E402
     sha256_file,
 )
 
+FINALIZED_HEAD_CHECKPOINT = BACKEND_DIR / "data" / "models" / "age_regression_head.pt"
+
 
 def select_image() -> tuple[str, bytes, tuple[int, int]]:
     """Select one persisted PNG deterministically, or build a technical fallback."""
@@ -69,7 +71,7 @@ def reference_prediction(image_bytes: bytes) -> float:
     if raw_feature.shape != EXPECTED_OUTPUT_SHAPE or raw_feature.dtype != np.int8:
         raise RuntimeError("Reference LiteRT output contract mismatch")
     feature = (raw_feature.astype(np.float32) - EXPECTED_OUTPUT_ZERO_POINT) * EXPECTED_OUTPUT_SCALE
-    checkpoint = torch.load(DEFAULT_HEAD_PATH, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(FINALIZED_HEAD_CHECKPOINT, map_location="cpu", weights_only=True)
     head = nn.Sequential(nn.Linear(2048, 256), nn.ReLU(), nn.Linear(256, 1)).cpu().eval()
     head.load_state_dict(checkpoint["model_state_dict"], strict=True)
     with torch.inference_mode():
@@ -104,7 +106,8 @@ def main() -> None:
         },
         "provenance": {
             "backbone_sha256": sha256_file(DEFAULT_BACKBONE_PATH),
-            "age_head_sha256": sha256_file(DEFAULT_HEAD_PATH),
+            "age_head_checkpoint_sha256": sha256_file(FINALIZED_HEAD_CHECKPOINT),
+            "numpy_age_head_sha256": sha256_file(DEFAULT_HEAD_PATH),
         },
         "service_result": asdict(result),
     }

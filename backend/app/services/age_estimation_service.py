@@ -10,10 +10,7 @@ from pathlib import Path
 from threading import Lock
 
 import numpy as np
-import torch
 from PIL import Image
-from torch import nn
-from torchvision.models import ResNet50_Weights
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -21,11 +18,21 @@ DEFAULT_BACKBONE_PATH = (
     BACKEND_DIR / "data" / "models" / "resnet50_backbone_w8a8.tflite"
 )
 DEFAULT_HEAD_PATH = (
-    BACKEND_DIR / "data" / "models" / "age_regression_head.pt"
+    BACKEND_DIR / "data" / "models" / "age_regression_head.npz"
 )
 
 EXPECTED_BACKBONE_SHA256 = "c3bdfb8002a40fe4892a2179616ea80fa2a2437d5c6a4402c01d0d15b9f6d5a0"
-EXPECTED_HEAD_SHA256 = "c9d757ee0dee4ce1aff96ec8526d001e3072e30ca27264991f0db0c4b4320fe8"
+EXPECTED_HEAD_SHA256 = "e9616bc044ab5a3308c61fbc132b5a692157ef7ac6d0cbba2461800614b55548"
+EXPECTED_HEAD_TENSORS = {
+    "linear1_weight": (256, 2048),
+    "linear1_bias": (256,),
+    "linear2_weight": (1, 256),
+    "linear2_bias": (1,),
+}
+RESIZE_SHORT_EDGE = 232
+CROP_SIZE = 224
+IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32).reshape(3, 1, 1)
+IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(3, 1, 1)
 EXPECTED_INPUT_SHAPE = (1, 3, 224, 224)
 EXPECTED_OUTPUT_SHAPE = (1, 2048)
 EXPECTED_INPUT_SCALE = 0.016827620565891266
@@ -126,7 +133,7 @@ class AgeEstimationService:
             self.backbone_path, EXPECTED_BACKBONE_SHA256, "INT8 backbone"
         )
         self.age_head_artifact_hash = _checked_artifact(
-            self.head_path, EXPECTED_HEAD_SHA256, "FP32 age head"
+            self.head_path, EXPECTED_HEAD_SHA256, "NumPy FP32 age head"
         )
         self._interpreter = self._load_interpreter(num_threads)
         self._input_detail, self._output_detail = self._validate_litert_contract()
@@ -134,7 +141,6 @@ class AgeEstimationService:
         self._output_scale, self._output_zero_point = _quantization(self._output_detail, "output")
         self._interpreter_lock = Lock()
         self._head = self._load_head()
-        self._preprocess = ResNet50_Weights.DEFAULT.transforms()
 
     def _load_interpreter(self, num_threads: int | None):
         try:
@@ -173,35 +179,54 @@ class AgeEstimationService:
             raise LiteRTContractError("Unexpected LiteRT output quantization contract")
         return input_detail, output_detail
 
-    def _load_head(self) -> nn.Sequential:
+    def _load_head(self) -> dict[str, np.ndarray]:
         try:
-            checkpoint = torch.load(self.head_path, map_location="cpu", weights_only=True)
-            state_dict = checkpoint["model_state_dict"]
-            expected_keys = {"0.weight", "0.bias", "2.weight", "2.bias"}
-            if set(state_dict) != expected_keys:
-                raise ValueError("unexpected state-dict keys")
-            if tuple(state_dict["0.weight"].shape) != (256, 2048) or tuple(state_dict["0.bias"].shape) != (256,):
-                raise ValueError("unexpected first linear-layer dimensions")
-            if tuple(state_dict["2.weight"].shape) != (1, 256) or tuple(state_dict["2.bias"].shape) != (1,):
-                raise ValueError("unexpected output linear-layer dimensions")
-            head = nn.Sequential(nn.Linear(2048, 256), nn.ReLU(), nn.Linear(256, 1)).cpu()
-            head.load_state_dict(state_dict, strict=True)
-            head.eval()
-            for parameter in head.parameters():
-                parameter.requires_grad_(False)
+            with np.load(self.head_path, allow_pickle=False) as artifact:
+                if set(artifact.files) != set(EXPECTED_HEAD_TENSORS):
+                    raise ValueError("unexpected tensor names")
+                head = {}
+                for name, expected_shape in EXPECTED_HEAD_TENSORS.items():
+                    tensor = np.asarray(artifact[name])
+                    if tensor.shape != expected_shape or tensor.dtype != np.float32:
+                        raise ValueError(f"invalid tensor contract for {name}")
+                    if not np.isfinite(tensor).all():
+                        raise ValueError(f"non-finite values in {name}")
+                    head[name] = tensor.copy()
             return head
         except Exception as exc:
-            raise HeadInferenceError("Could not load finalized FP32 age-head checkpoint") from exc
+            raise HeadInferenceError("Could not load finalized NumPy FP32 age-head artifact") from exc
+
+    @staticmethod
+    def _resize_crop_short_edge(image: Image.Image) -> Image.Image:
+        width, height = image.size
+        if min(width, height) != RESIZE_SHORT_EDGE:
+            if width <= height:
+                resized_width = RESIZE_SHORT_EDGE
+                resized_height = int(RESIZE_SHORT_EDGE * height / width)
+            else:
+                resized_height = RESIZE_SHORT_EDGE
+                resized_width = int(RESIZE_SHORT_EDGE * width / height)
+            image = image.resize(
+                (resized_width, resized_height),
+                resample=Image.Resampling.BILINEAR,
+            )
+        width, height = image.size
+        left = int(round((width - CROP_SIZE) / 2.0))
+        top = int(round((height - CROP_SIZE) / 2.0))
+        return image.crop((left, top, left + CROP_SIZE, top + CROP_SIZE))
 
     def _prepare_input(self, image_bytes: bytes) -> np.ndarray:
         try:
             with Image.open(BytesIO(image_bytes)) as source:
-                tensor = self._preprocess(source.convert("RGB"))
+                image = self._resize_crop_short_edge(source.convert("RGB"))
+                pixels = np.asarray(image, dtype=np.uint8).copy()
         except (OSError, ValueError, TypeError) as exc:
             raise InvalidImageError("Image bytes cannot be decoded as an RGB image") from exc
-        if tuple(tensor.shape) != EXPECTED_INPUT_SHAPE[1:] or tensor.dtype != torch.float32:
-            raise InvalidImageError(f"Canonical preprocessing returned {tensor.shape} {tensor.dtype}")
-        prepared = tensor.unsqueeze(0).contiguous().numpy().astype(np.float32, copy=False)
+        if pixels.shape != (CROP_SIZE, CROP_SIZE, 3):
+            raise InvalidImageError(f"Canonical preprocessing returned pixel shape {pixels.shape}")
+        prepared = pixels.transpose(2, 0, 1).astype(np.float32) / np.float32(255.0)
+        prepared = (prepared - IMAGENET_MEAN) / IMAGENET_STD
+        prepared = prepared[np.newaxis, ...].astype(np.float32, copy=False)
         if prepared.shape != EXPECTED_INPUT_SHAPE or not np.isfinite(prepared).all():
             raise InvalidImageError("Canonical preprocessing produced an invalid input tensor")
         return prepared
@@ -224,8 +249,11 @@ class AgeEstimationService:
         if not np.isfinite(dequantized).all():
             raise BackboneInferenceError("LiteRT backbone dequantization produced non-finite features")
         try:
-            with torch.inference_mode():
-                raw_prediction = float(self._head(torch.from_numpy(dequantized)).squeeze().item())
+            hidden = dequantized @ self._head["linear1_weight"].T
+            hidden = np.maximum(hidden + self._head["linear1_bias"], np.float32(0.0))
+            output = hidden @ self._head["linear2_weight"].T
+            output = output + self._head["linear2_bias"]
+            raw_prediction = float(output.squeeze().item())
         except Exception as exc:
             raise HeadInferenceError("Finalized FP32 age-head inference failed") from exc
         if not math.isfinite(raw_prediction):

@@ -25,6 +25,7 @@ backend/data/models/*
 !backend/data/models/.gitkeep
 !backend/data/models/resnet50_backbone_w8a8.tflite
 !backend/data/models/age_regression_head.pt
+!backend/data/models/age_regression_head.npz
 backend/data/face_landmark_experiments/*
 !backend/data/face_landmark_experiments/.gitkeep
 
@@ -42,5 +43,6 @@ backend/experiments/age_regression/runs/
 *.tflite
 !backend/data/models/age_regression_head.pt
 !backend/data/models/resnet50_backbone_w8a8.tflite
+!backend/data/models/age_regression_head.npz
 
 *.tsbuildinfo

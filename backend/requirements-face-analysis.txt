@@ -1,0 +1,5 @@
+# Optional dependencies used only by the explicitly requested FaceAnalysisService routes.
+# Install this file in addition to requirements.txt if face analysis/benchmark is needed.
+-r requirements.txt
+torch==2.13.0
+torchvision==0.28.0

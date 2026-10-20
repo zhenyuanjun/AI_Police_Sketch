@@ -44,13 +44,24 @@ _analysis_service_lock = Lock()
 _age_estimation_service_lock = Lock()
 
 
+class FaceAnalysisUnavailableError(RuntimeError):
+    """Raised when the optional PyTorch face-analysis dependencies are absent."""
+
+
 def get_analysis_service():
     """Load the optional ResNet visual-analysis model on its first requested use."""
     global analysis_service
     if analysis_service is None:
         with _analysis_service_lock:
             if analysis_service is None:
-                from app.services.face_analysis_service import FaceAnalysisService
+                try:
+                    from app.services.face_analysis_service import FaceAnalysisService
+                except (ImportError, ModuleNotFoundError) as exc:
+                    logger.warning("Optional face-analysis dependencies are unavailable: %s", exc)
+                    raise FaceAnalysisUnavailableError(
+                        "Optional face analysis requires the dependencies in "
+                        "backend/requirements-face-analysis.txt."
+                    ) from exc
 
                 analysis_service = FaceAnalysisService()
     return analysis_service
@@ -122,6 +133,8 @@ def compare_sketch_versions(
         raise HTTPException(status_code=404, detail="One or both sketch versions were not found.")
     try:
         result = get_analysis_service().compare(image_a, image_b)
+    except FaceAnalysisUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     metadata_b = image_storage.get_version_metadata(sketch_id, version_b) or {}
@@ -162,6 +175,8 @@ def analyze_sketch(sketch_id: str) -> FaceAnalysisResponse:
         raise HTTPException(status_code=404, detail="No generated image is available for this sketch.")
     try:
         return FaceAnalysisResponse(**get_analysis_service().analyze(image_bytes))
+    except FaceAnalysisUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -173,6 +188,8 @@ def benchmark_sketch(sketch_id: str) -> BenchmarkResponse:
         raise HTTPException(status_code=404, detail="No generated image is available for this sketch.")
     try:
         return BenchmarkResponse(**get_analysis_service().benchmark(image_bytes))
+    except FaceAnalysisUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
