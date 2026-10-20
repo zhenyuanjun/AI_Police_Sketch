@@ -23,6 +23,8 @@ backend/data/generated_sketches/*.png
 backend/data/generated_sketches/*.json
 backend/data/models/*
 !backend/data/models/.gitkeep
+!backend/data/models/resnet50_backbone_w8a8.tflite
+!backend/data/models/age_regression_head.pt
 backend/data/face_landmark_experiments/*
 !backend/data/face_landmark_experiments/.gitkeep
 
@@ -38,5 +40,7 @@ backend/experiments/age_regression/runs/
 *.pth
 *.onnx
 *.tflite
+!backend/data/models/age_regression_head.pt
+!backend/data/models/resnet50_backbone_w8a8.tflite
 
 *.tsbuildinfo

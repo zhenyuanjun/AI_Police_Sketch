@@ -18,10 +18,10 @@ from torchvision.models import ResNet50_Weights
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_BACKBONE_PATH = (
-    BACKEND_DIR / "experiments" / "age_regression" / "output" / "age4b2_int8" / "resnet50_backbone_w8a8.tflite"
+    BACKEND_DIR / "data" / "models" / "resnet50_backbone_w8a8.tflite"
 )
 DEFAULT_HEAD_PATH = (
-    BACKEND_DIR / "experiments" / "age_regression" / "output" / "runs" / "age3a_cached_head" / "best_checkpoint.pt"
+    BACKEND_DIR / "data" / "models" / "age_regression_head.pt"
 )
 
 EXPECTED_BACKBONE_SHA256 = "c3bdfb8002a40fe4892a2179616ea80fa2a2437d5c6a4402c01d0d15b9f6d5a0"

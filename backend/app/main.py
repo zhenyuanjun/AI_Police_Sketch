@@ -17,7 +17,11 @@ from app.services.sketch_generation import OpenAISketchGenerationService, MockSk
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Police Sketch API", version="0.1.0")
-origins = [os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")]
+origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRONTEND_ORIGIN", "http://localhost:3000").split(",")
+    if origin.strip()
+]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 def create_generation_service() -> SketchGenerationService:
     provider = os.getenv("SKETCH_PROVIDER", "mock").strip().lower()

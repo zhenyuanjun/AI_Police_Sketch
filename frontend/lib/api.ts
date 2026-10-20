@@ -6,7 +6,7 @@ export type SavedVersion = { version: number; generation_type: string; refinemen
 export type SavedSketch = { sketch_id: string; latest_version: number; generation_type: string; created_at: string; image_url: string; witness_age?: number | null; versions: SavedVersion[] };
 export type SketchComparison = { sketch_id: string; version_a: number; version_b: number; model: string; embedding_dimension: number; cosine_similarity: number; cosine_distance: number; refinement_instruction?: string | null };
 export type AgeAnalysis = { sketch_id: string; version: number; status: string; ml_estimated_age: number; out_of_training_range: boolean; model: string; training_domain: string; interpretation: string; artifact_sha256: { backbone: string; age_head: string } };
-const baseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const baseUrl = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = options?.body instanceof FormData ? options?.headers : { "Content-Type": "application/json", ...options?.headers };
   const response = await fetch(`${baseUrl}${path}`, { ...options, headers });
