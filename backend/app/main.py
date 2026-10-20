@@ -7,10 +7,9 @@ from fastapi import FastAPI, HTTPException, Path as ApiPath, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from threading import Lock
 
 from app.schemas.sketches import AgeAnalysisResponse, BenchmarkResponse, FaceAnalysisResponse, GenerateSketchRequest, RefineSketchRequest, SavedSketchResponse, SketchComparisonResponse, SketchResponse
-from app.services.age_estimation_service import AgeEstimationError, AgeEstimationService, BackboneInferenceError, HeadInferenceError, InvalidImageError
-from app.services.face_analysis_service import FaceAnalysisService
 from app.services.image_storage import LocalSketchImageStorage
 from app.services.sketch_generation import OpenAISketchGenerationService, MockSketchGenerationService, SketchGenerationService
 
@@ -34,20 +33,38 @@ def create_generation_service() -> SketchGenerationService:
 
 
 service: SketchGenerationService = create_generation_service()
-analysis_service = FaceAnalysisService()
 image_storage = LocalSketchImageStorage()
+analysis_service = None
+age_estimation_service = None
+_analysis_service_lock = Lock()
+_age_estimation_service_lock = Lock()
 
 
-def create_age_estimation_service() -> Optional[AgeEstimationService]:
-    """Keep the application available if optional age-model provenance/loading fails."""
-    try:
-        return AgeEstimationService()
-    except Exception:
-        logger.exception("Age estimation service is unavailable; sketch features remain available.")
-        return None
+def get_analysis_service():
+    """Load the optional ResNet visual-analysis model on its first requested use."""
+    global analysis_service
+    if analysis_service is None:
+        with _analysis_service_lock:
+            if analysis_service is None:
+                from app.services.face_analysis_service import FaceAnalysisService
+
+                analysis_service = FaceAnalysisService()
+    return analysis_service
 
 
-age_estimation_service = create_age_estimation_service()
+def get_age_estimation_service():
+    """Load the finalized age runtime only when age analysis is first requested."""
+    global age_estimation_service
+    if age_estimation_service is None:
+        with _age_estimation_service_lock:
+            if age_estimation_service is None:
+                from app.services.age_estimation_service import AgeEstimationService
+
+                try:
+                    age_estimation_service = AgeEstimationService()
+                except Exception:
+                    logger.exception("Age estimation service is unavailable.")
+    return age_estimation_service
 
 
 def response_from_sketch(sketch):
@@ -84,7 +101,7 @@ def compare_sketch_versions(
     if image_a is None or image_b is None:
         raise HTTPException(status_code=404, detail="One or both sketch versions were not found.")
     try:
-        result = analysis_service.compare(image_a, image_b)
+        result = get_analysis_service().compare(image_a, image_b)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     metadata_b = image_storage.get_version_metadata(sketch_id, version_b) or {}
@@ -124,7 +141,7 @@ def analyze_sketch(sketch_id: str) -> FaceAnalysisResponse:
     if image_bytes is None:
         raise HTTPException(status_code=404, detail="No generated image is available for this sketch.")
     try:
-        return FaceAnalysisResponse(**analysis_service.analyze(image_bytes))
+        return FaceAnalysisResponse(**get_analysis_service().analyze(image_bytes))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -135,7 +152,7 @@ def benchmark_sketch(sketch_id: str) -> BenchmarkResponse:
     if image_bytes is None:
         raise HTTPException(status_code=404, detail="No generated image is available for this sketch.")
     try:
-        return BenchmarkResponse(**analysis_service.benchmark(image_bytes))
+        return BenchmarkResponse(**get_analysis_service().benchmark(image_bytes))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -143,13 +160,21 @@ def benchmark_sketch(sketch_id: str) -> BenchmarkResponse:
 @app.post("/api/sketches/{sketch_id}/versions/{version}/age-analysis", response_model=AgeAnalysisResponse)
 def analyze_sketch_age(sketch_id: str, version: int = ApiPath(ge=1)) -> AgeAnalysisResponse:
     """Run exploratory age inference on exactly one persisted sketch version."""
+    from app.services.age_estimation_service import (
+        AgeEstimationError,
+        BackboneInferenceError,
+        HeadInferenceError,
+        InvalidImageError,
+    )
+
     image_bytes = image_storage.load_version(sketch_id, version)
     if image_bytes is None:
         raise HTTPException(status_code=404, detail="Saved sketch version not found.")
-    if age_estimation_service is None:
+    estimator = get_age_estimation_service()
+    if estimator is None:
         raise HTTPException(status_code=503, detail="Age analysis service is unavailable.")
     try:
-        result = age_estimation_service.estimate_from_image_bytes(image_bytes)
+        result = estimator.estimate_from_image_bytes(image_bytes)
     except InvalidImageError as exc:
         raise HTTPException(status_code=422, detail="Saved sketch image cannot be analyzed.") from exc
     except (BackboneInferenceError, HeadInferenceError, AgeEstimationError) as exc:
