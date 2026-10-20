@@ -65,13 +65,13 @@ class OpenAISketchGenerationService(SketchGenerationService):
     MODEL = "gpt-image-2.5-flare"
     EDIT_MODEL = "gpt-image-1"
 
-    def __init__(self) -> None:
+    def __init__(self, image_storage=None) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         from openai import OpenAI
         self._client = OpenAI(api_key=api_key) if api_key else None
         self._sketches: Dict[str, Sketch] = {}
         self._image_bytes: Dict[str, bytes] = {}
-        self._image_storage = LocalSketchImageStorage()
+        self._image_storage = image_storage or LocalSketchImageStorage()
 
     @staticmethod
     def _image_from_response(result) -> tuple[str, bytes]:

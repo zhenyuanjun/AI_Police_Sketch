@@ -1,39 +1,43 @@
+import base64
+import binascii
 import os
 from pathlib import Path
 import logging
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Path as ApiPath, Query
+from fastapi import Body, FastAPI, HTTPException, Path as ApiPath, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from threading import Lock
 
 from app.schemas.sketches import AgeAnalysisResponse, BenchmarkResponse, FaceAnalysisResponse, GenerateSketchRequest, RefineSketchRequest, SavedSketchResponse, SketchComparisonResponse, SketchResponse
-from app.services.image_storage import LocalSketchImageStorage
+from app.services.image_storage import create_sketch_image_storage
 from app.services.sketch_generation import OpenAISketchGenerationService, MockSketchGenerationService, SketchGenerationService
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Police Sketch API", version="0.1.0")
+MAX_IMAGE_DATA_URL_LENGTH = 22 * 1024 * 1024
 origins = [
     origin.strip().rstrip("/")
     for origin in os.getenv("FRONTEND_ORIGIN", "http://localhost:3000").split(",")
     if origin.strip()
 ]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-def create_generation_service() -> SketchGenerationService:
+def create_generation_service(storage) -> SketchGenerationService:
     provider = os.getenv("SKETCH_PROVIDER", "mock").strip().lower()
     logger.info("Sketch provider: %s", provider)
     if provider == "mock":
         return MockSketchGenerationService()
     if provider == "openai":
-        return OpenAISketchGenerationService()
+        return OpenAISketchGenerationService(image_storage=storage)
     raise RuntimeError("SKETCH_PROVIDER must be either 'mock' or 'openai'.")
 
 
-service: SketchGenerationService = create_generation_service()
-image_storage = LocalSketchImageStorage()
+image_storage = create_sketch_image_storage()
+service: SketchGenerationService = create_generation_service(image_storage)
+logger.info("Sketch storage backend location: %s", image_storage.root)
 analysis_service = None
 age_estimation_service = None
 _analysis_service_lock = Lock()
@@ -70,6 +74,22 @@ def get_age_estimation_service():
 def response_from_sketch(sketch):
     status = "openai" if sketch.image_url else "mock"
     return SketchResponse(id=sketch.id, version=sketch.version, description=sketch.description, refinement_instruction=sketch.refinement_instruction, image_url=sketch.image_url, status=status, witness_age=sketch.witness_age)
+
+
+def decode_image_data_url(image_data_url: str) -> bytes:
+    """Decode a bounded PNG/JPEG data URL supplied for cross-instance analysis."""
+    if len(image_data_url) > MAX_IMAGE_DATA_URL_LENGTH:
+        raise HTTPException(status_code=413, detail="Image data is too large for age analysis.")
+    header, separator, encoded = image_data_url.partition(",")
+    if not separator or header not in ("data:image/png;base64", "data:image/jpeg;base64"):
+        raise HTTPException(status_code=422, detail="Age analysis requires a PNG or JPEG data URL.")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Image data is malformed.") from exc
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="Image data is empty.")
+    return image_bytes
 
 
 @app.get("/health")
@@ -158,7 +178,11 @@ def benchmark_sketch(sketch_id: str) -> BenchmarkResponse:
 
 
 @app.post("/api/sketches/{sketch_id}/versions/{version}/age-analysis", response_model=AgeAnalysisResponse)
-def analyze_sketch_age(sketch_id: str, version: int = ApiPath(ge=1)) -> AgeAnalysisResponse:
+def analyze_sketch_age(
+    sketch_id: str,
+    version: int = ApiPath(ge=1),
+    image_data_url: Optional[str] = Body(default=None, embed=True),
+) -> AgeAnalysisResponse:
     """Run exploratory age inference on exactly one persisted sketch version."""
     from app.services.age_estimation_service import (
         AgeEstimationError,
@@ -169,7 +193,25 @@ def analyze_sketch_age(sketch_id: str, version: int = ApiPath(ge=1)) -> AgeAnaly
 
     image_bytes = image_storage.load_version(sketch_id, version)
     if image_bytes is None:
-        raise HTTPException(status_code=404, detail="Saved sketch version not found.")
+        if image_data_url is None:
+            logger.warning(
+                "Age analysis 404: sketch_id=%s version=%s image_data_url_supplied=false "
+                "storage_root=%s process_id=%s",
+                sketch_id,
+                version,
+                image_storage.root,
+                os.getpid(),
+            )
+            raise HTTPException(status_code=404, detail="Saved sketch version not found.")
+        image_bytes = decode_image_data_url(image_data_url)
+        logger.warning(
+            "Age analysis using client image fallback because sketch version is missing from storage: "
+            "sketch_id=%s version=%s storage_root=%s process_id=%s",
+            sketch_id,
+            version,
+            image_storage.root,
+            os.getpid(),
+        )
     estimator = get_age_estimation_service()
     if estimator is None:
         raise HTTPException(status_code=503, detail="Age analysis service is unavailable.")
@@ -190,7 +232,14 @@ def analyze_sketch_age(sketch_id: str, version: int = ApiPath(ge=1)) -> AgeAnaly
         "age_head_hash": result.age_head_artifact_hash,
     })
     if not persisted:
-        raise HTTPException(status_code=500, detail="Age analysis could not be recorded.")
+        logger.warning(
+            "Age analysis succeeded but could not be persisted: sketch_id=%s version=%s "
+            "storage_root=%s process_id=%s",
+            sketch_id,
+            version,
+            image_storage.root,
+            os.getpid(),
+        )
     return AgeAnalysisResponse(
         sketch_id=sketch_id,
         version=version,
