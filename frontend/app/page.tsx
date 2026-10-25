@@ -2,8 +2,9 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import Face3DViewer from "../components/Face3DViewer";
-import { AgeAnalysis, api, Benchmark, FaceAnalysis, SavedSketch, Sketch, SketchComparison } from "../lib/api";
-import { deserializeHistory, HISTORY_STORAGE_KEY, HistorySketch, historyForSketch, mergeHistory, serializeHistory } from "../lib/history";
+import { AgeAnalysis, api, SavedSketch, Sketch, SketchComparison } from "../lib/api";
+import { HistorySketch, historyForSketch, historySessions, mergeHistory } from "../lib/history";
+import { migrateLocalHistory, writeHistory } from "../lib/historyDb";
 
 const example = "Male, around 30 years old, oval face, short black hair, thick eyebrows, narrow eyes, medium-sized nose, thin lips.";
 
@@ -49,6 +50,13 @@ async function imageUrlToDataUrl(url: string): Promise<string | null> {
   }
 }
 
+async function persistableSketch(sketch: HistorySketch, apiBaseUrl: string): Promise<HistorySketch> {
+  if (sketch.image_url?.startsWith("data:image/")) return sketch;
+  const url = sketch.image_url?.startsWith("/") ? `${apiBaseUrl}${sketch.image_url}` : sketch.image_url;
+  const image = url ? await imageUrlToDataUrl(url) : null;
+  return image ? { ...sketch, image_url: image } : sketch;
+}
+
 export default function Home() {
   const [description, setDescription] = useState("");
   const [witnessAge, setWitnessAge] = useState("");
@@ -60,14 +68,12 @@ export default function Home() {
   const [saved, setSaved] = useState<SavedSketch[]>([]);
   const [showAllHistory, setShowAllHistory] = useState(false);
   const [current, setCurrent] = useState<Sketch | null>(null);
-  const [analysis, setAnalysis] = useState<FaceAnalysis | null>(null);
-  const [benchmark, setBenchmark] = useState<Benchmark | null>(null);
   const [comparisons, setComparisons] = useState<Record<string, SketchComparison>>({});
   const [ageAnalyses, setAgeAnalyses] = useState<Record<string, AgeAnalysis>>({});
   const [ageError, setAgeError] = useState<{ key: string; message: string } | null>(null);
   const [ageLoadingKey, setAgeLoadingKey] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
-  const [busy, setBusy] = useState<"generate" | "refine" | "benchmark" | "compare" | null>(null);
+  const [busy, setBusy] = useState<"generate" | "refine" | "compare" | null>(null);
   const [error, setError] = useState("");
   const currentAgeKey = current ? analysisKey(current) : null;
   const currentAgeAnalysis = currentAgeKey ? ageAnalyses[currentAgeKey] : undefined;
@@ -106,21 +112,28 @@ export default function Home() {
       age: currentAge ?? existing?.age ?? null,
     });
   });
-  const historyEntries = Array.from(historyEntriesByKey.values()).reverse();
+  const retainedSessionIds = new Set(historySessions(Array.from(historyEntriesByKey.values(), (entry) => entry.sketch)).slice(0, 10).map((session) => session.id));
+  const historyEntries = Array.from(historyEntriesByKey.values()).filter(({ sketch }) => retainedSessionIds.has(sketch.id)).reverse();
   const visibleHistoryEntries = showAllHistory ? historyEntries : historyEntries.slice(0, 10);
 
   useEffect(() => {
-    let snapshot = deserializeHistory(null);
-    try {
-      snapshot = deserializeHistory(window.localStorage.getItem(HISTORY_STORAGE_KEY));
-    } catch {
-      setHistoryStorageWarning("Browser storage is unavailable; history will last only for this page session.");
-    }
-    setLocalHistory(snapshot.sketches);
-    setAgeAnalyses(snapshot.ageAnalyses);
-    setHistoryReady(true);
+    let active = true;
+    let snapshot = { sketches: [] as HistorySketch[], ageAnalyses: {} as Record<string, AgeAnalysis> };
+    const historyLoaded = migrateLocalHistory().then((loaded) => {
+      if (!active) return;
+      snapshot = loaded;
+      setLocalHistory(loaded.sketches);
+      setAgeAnalyses(loaded.ageAnalyses);
+      setHistoryReady(true);
+    }).catch(() => {
+      if (!active) return;
+      setHistoryStorageWarning("Browser history storage is unavailable; changes may not persist on this device.");
+      setHistoryReady(true);
+      return undefined;
+    });
 
     api.saved().then(async (remoteSaved) => {
+      await historyLoaded;
       setSaved(remoteSaved);
       const remoteSketches: HistorySketch[] = [];
       const remoteAnalyses: Record<string, AgeAnalysis> = {};
@@ -129,9 +142,7 @@ export default function Home() {
           const key = `${savedSketch.sketch_id}:${version.version}`;
           const localVersion = snapshot.sketches.find((item) => analysisKey(item) === key);
           const remoteUrl = `${apiBaseUrl}${version.image_url}`;
-          const dataImageUrl = localVersion?.image_url?.startsWith("data:image/")
-            ? localVersion.image_url
-            : await imageUrlToDataUrl(remoteUrl);
+          const dataImageUrl = localVersion?.image_url?.startsWith("data:image/") ? localVersion.image_url : await imageUrlToDataUrl(remoteUrl);
           if (dataImageUrl) remoteSketches.push({
             id: savedSketch.sketch_id,
             version: version.version,
@@ -148,30 +159,25 @@ export default function Home() {
       setLocalHistory((items) => mergeHistory(items, remoteSketches));
       setAgeAnalyses((items) => ({ ...remoteAnalyses, ...snapshot.ageAnalyses, ...items }));
     }).catch(() => setSaved([]));
+    return () => { active = false; };
   }, [apiBaseUrl]);
 
   useEffect(() => {
     if (!historyReady) return;
-    try {
-      window.localStorage.setItem(HISTORY_STORAGE_KEY, serializeHistory({ sketches: localHistory, ageAnalyses }));
-      setHistoryStorageWarning("");
-    } catch {
-      setHistoryStorageWarning("Browser storage is full or unavailable; new history may not persist on this device.");
-    }
+    writeHistory({ sketches: localHistory, ageAnalyses }).then(() => setHistoryStorageWarning("")).catch(() => setHistoryStorageWarning("Browser history storage is unavailable; changes may not persist on this device."));
   }, [historyReady, localHistory, ageAnalyses]);
-  async function analyze(id: string) { try { setAnalysis(await api.analyze(id)); } catch { setAnalysis(null); } }
   function selectSketch(sketch: Sketch) { setCurrent(sketch); setAgeError(null); }
   function selectHistoryEntry(sketch: Sketch, age: AgeAnalysis | null) {
     selectSketch(sketch);
+    setDescription(sketch.description === "Saved sketch" ? "" : sketch.description);
+    setWitnessAge(sketch.witness_age == null ? "" : String(sketch.witness_age));
+    setInstruction(sketch.version > 1 ? sketch.refinement_instruction || "" : "");
     setHistory(historyForSketch(historyEntries.map((entry) => entry.sketch), sketch.id));
-    setAnalysis(null);
-    setBenchmark(null);
     if (age) setAgeAnalyses((items) => ({ ...items, [analysisKey(sketch)]: age }));
   }
-  async function generate(event: FormEvent) { event.preventDefault(); if (!description.trim()) return setError("Please enter an eyewitness description first."); const parsedAge = witnessAge.trim() === "" ? undefined : Number(witnessAge); if (parsedAge !== undefined && (!Number.isFinite(parsedAge) || parsedAge < 1 || parsedAge > 120)) return setError("Witness Age must be a number from 1 to 120."); setBusy("generate"); setError(""); try { const sketch = await api.generate(description, parsedAge); const savedSketch: HistorySketch = { ...sketch, created_at: new Date().toISOString() }; setCurrent(savedSketch); setHistory([savedSketch]); setLocalHistory((items) => mergeHistory(items, [savedSketch])); setAnalysis(null); setBenchmark(null); setAgeError(null); await analyze(sketch.id); } catch (err) { setError(err instanceof Error ? err.message : "Unable to generate sketch."); } finally { setBusy(null); } }
-  async function refine(event: FormEvent) { event.preventDefault(); if (!current) return; if (!instruction.trim()) return setError("Please enter a refinement instruction."); setBusy("refine"); setError(""); try { const sketch = await api.refine(current.id, instruction); const savedSketch: HistorySketch = { ...sketch, created_at: new Date().toISOString() }; setCurrent(savedSketch); setHistory((items) => [...items, savedSketch]); setLocalHistory((items) => mergeHistory(items, [savedSketch])); setInstruction(""); setAnalysis(null); setBenchmark(null); setAgeError(null); await analyze(sketch.id); } catch (err) { setError(err instanceof Error ? err.message : "Unable to refine sketch."); } finally { setBusy(null); } }
-  async function runBenchmark() { if (!current) return; setBusy("benchmark"); setError(""); try { setBenchmark(await api.benchmark(current.id)); } catch (err) { setError(err instanceof Error ? err.message : "Unable to run benchmark."); } finally { setBusy(null); } }
-  async function analyzeAge() { if (!current || !canAnalyzeAge) return; const selected = current; const key = analysisKey(selected); setAgeLoadingKey(key); setAgeError(null); try { const result = await api.analyzeAge(selected.id, selected.version, selected.image_url); if (result.sketch_id !== selected.id || result.version !== selected.version) throw new Error("Age analysis returned a different sketch version."); setAgeAnalyses((items) => ({ ...items, [key]: { ...result, analyzed_at: new Date().toISOString() } })); } catch { setAgeError({ key, message: "Age analysis is unavailable for this sketch." }); } finally { setAgeLoadingKey(null); } }
+  async function generate(event: FormEvent) { event.preventDefault(); if (!description.trim()) return setError("Please enter an eyewitness description first."); const parsedAge = witnessAge.trim() === "" ? undefined : Number(witnessAge); if (parsedAge !== undefined && (!Number.isFinite(parsedAge) || parsedAge < 1 || parsedAge > 120)) return setError("Witness Age must be a number from 1 to 120."); setBusy("generate"); setError(""); try { const sketch = await api.generate(description, parsedAge); const savedSketch = await persistableSketch({ ...sketch, created_at: new Date().toISOString() }, apiBaseUrl); setCurrent(savedSketch); setHistory([savedSketch]); setLocalHistory((items) => mergeHistory(items, [savedSketch])); setAgeError(null); } catch (err) { setError(err instanceof Error ? err.message : "Unable to generate sketch."); } finally { setBusy(null); } }
+  async function refine(event: FormEvent) { event.preventDefault(); if (!current) return; if (!instruction.trim()) return setError("Please enter a refinement instruction."); setBusy("refine"); setError(""); try { const sketch = await api.refine(current.id, instruction); const savedSketch = await persistableSketch({ ...sketch, created_at: new Date().toISOString() }, apiBaseUrl); setCurrent(savedSketch); setHistory((items) => [...items, savedSketch]); setLocalHistory((items) => mergeHistory(items, [savedSketch])); setInstruction(""); setAgeError(null); } catch (err) { const message = err instanceof Error ? err.message : "Unable to refine sketch."; setError(/no generated image|image.*available/i.test(message) ? "This older sketch can still be viewed and analyzed, but its source image is no longer on the sketch service. Generate a new sketch before refining." : message); } finally { setBusy(null); } }
+  async function analyzeAge() { if (!current || !canAnalyzeAge) return; const selected = current; const key = analysisKey(selected); const hasSavedResult = Boolean(ageAnalyses[key]); setAgeLoadingKey(key); setAgeError(null); try { const result = await api.analyzeAge(selected.id, selected.version, selected.image_url); if (result.sketch_id !== selected.id || result.version !== selected.version) throw new Error("Age analysis returned a different sketch version."); setAgeAnalyses((items) => ({ ...items, [key]: { ...result, analyzed_at: new Date().toISOString() } })); } catch { setAgeError({ key, message: hasSavedResult ? "Re-analysis failed; the saved ML age result is still shown." : "Age analysis is unavailable for this sketch." }); } finally { setAgeLoadingKey(null); } }
   async function compareVersions(id: string, versionA: number, versionB: number) { const key = `${id}:${versionA}-${versionB}`; setBusy("compare"); setError(""); try { const result = await api.compare(id, versionA, versionB); setComparisons((items) => ({ ...items, [key]: result })); } catch (err) { setError(err instanceof Error ? err.message : "Unable to compare sketch versions."); } finally { setBusy(null); } }
 
   return <main className="mx-auto min-h-screen max-w-[1440px] px-6 py-8 md:px-12">
@@ -181,7 +187,7 @@ export default function Home() {
       <section><div className="mb-4"><p className="label">01 / Input method</p><h2 className="section-title">Create a Starting Sketch</h2></div><form onSubmit={generate} className="border-t border-[var(--ink)] pt-4"><div className="mb-2 flex justify-end"><button type="button" className="text-xs text-[var(--accent)] underline underline-offset-4" onClick={() => setDescription(example)}>Load example</button></div><textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={2000} className="h-52 w-full resize-none border border-[var(--line)] bg-white p-4 text-[15px] leading-6 outline-none transition focus:border-[var(--accent)]" placeholder="Describe the person's approximate age, face shape, hair, eyebrows, eyes, nose, lips, facial hair, distinguishing features, and other visible characteristics..." /><label className="mt-4 block text-sm font-bold text-[var(--ink)]">Witness Age <span className="font-normal text-[var(--muted)]">(optional)</span><input type="number" min="1" max="120" step="1" inputMode="numeric" value={witnessAge} onChange={(event) => setWitnessAge(event.target.value)} placeholder="35" className="mt-2 block w-full border border-[var(--line)] bg-white p-3 text-sm font-normal outline-none focus:border-[var(--accent)]" /></label><div className="mt-2 flex justify-between text-xs text-[var(--muted)]"><span>Natural language input</span><span>{description.length} / 2000</span></div><button disabled={Boolean(busy)} className="mt-7 w-full bg-[var(--ink)] px-5 py-4 text-sm font-bold uppercase tracking-[0.14em] text-white transition hover:bg-[#35424b] disabled:cursor-wait disabled:opacity-60">{busy === "generate" ? "Generating..." : "Generate Sketch"}</button></form>{current && <form onSubmit={refine} className="mt-12 border-t border-[var(--line)] pt-5"><p className="label">02 / Iterate</p><h2 className="section-title">Refine Sketch</h2><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} className="mt-4 h-28 w-full resize-none border border-[var(--line)] bg-white p-4 text-sm leading-6 outline-none focus:border-[var(--accent)]" placeholder="Example: Make the eyebrows thicker, make the jaw slightly wider, and add a small scar above the left eyebrow." /><button disabled={Boolean(busy)} className="mt-3 border border-[var(--ink)] px-5 py-3 text-xs font-bold uppercase tracking-[0.14em] hover:bg-white disabled:opacity-50">{busy === "refine" ? "Updating..." : "Update Sketch"}</button></form>}{error && <p className="mt-5 border-l-2 border-[var(--accent)] bg-[#fff6f1] p-3 text-sm text-[#8d4327]">{error}</p>}</section>
       <section><div className="mb-4"><p className="label">03 / Output</p><h2 className="section-title">Generated Sketch</h2><div className="mt-3 inline-flex border border-[var(--line)] bg-white p-1 text-xs font-bold uppercase tracking-[0.12em]"><button type="button" onClick={() => setViewMode("2d")} className={`px-3 py-2 ${viewMode === "2d" ? "bg-[var(--ink)] text-white" : "text-[var(--muted)]"}`}>2D Sketch</button><button type="button" onClick={() => setViewMode("3d")} className={`px-3 py-2 ${viewMode === "3d" ? "bg-[var(--ink)] text-white" : "text-[var(--muted)]"}`}>3D View</button></div></div>{viewMode === "3d" ? <Face3DViewer /> : <MockPortrait sketch={current} />}{current && viewMode === "2d" && <p className="mt-3 text-xs text-[var(--muted)]">{current.image_url ? "Generated image output." : "Mock output only."}</p>}
         {current && <div className="mt-6 border-t border-[var(--line)] pt-4"><p className="label">ML Age Analysis</p><div className="mt-3 border border-[var(--line)] bg-white p-4 text-sm text-[var(--muted)]">{canAnalyzeAge ? <button type="button" onClick={analyzeAge} disabled={ageLoadingKey !== null} className="border border-[var(--ink)] px-4 py-2 text-xs font-bold uppercase tracking-[0.12em] hover:bg-[#f7f4ee] disabled:cursor-wait disabled:opacity-50">{ageLoadingKey === currentAgeKey ? "Analyzing age..." : "Analyze Age"}</button> : <p>Age analysis requires an image-backed sketch.</p>}{currentAgeError && <p className="mt-3 border-l-2 border-[var(--accent)] bg-[#fff6f1] p-3 text-sm text-[#8d4327]">{currentAgeError}</p>}{currentAgeAnalysis?.out_of_training_range ? <p className="mt-3 border-l-2 border-[var(--accent)] bg-[#fff6f1] p-3 text-sm text-[#8d4327]">Model prediction is outside its training age range (1–101). Result withheld.</p> : currentAgeAnalysis && <div className="mt-4"><p className="text-xs font-bold uppercase tracking-[0.12em] text-[var(--muted)]">ML Estimated Age</p><p className="mt-1 font-serif text-3xl text-[var(--ink)]">{currentAgeAnalysis.ml_estimated_age.toFixed(1)} years</p>{current.witness_age != null && <div className="mt-4 grid grid-cols-3 gap-2 border-t border-[var(--line)] pt-3 text-sm"><span>Witness Age: <b className="text-[var(--ink)]">{current.witness_age}</b></span><span>ML Estimated Age: <b className="text-[var(--ink)]">{currentAgeAnalysis.ml_estimated_age.toFixed(1)}</b></span><span>Visual Age Difference: <b className="text-[var(--ink)]">{`${currentAgeAnalysis.ml_estimated_age - current.witness_age >= 0 ? "+" : ""}${(currentAgeAnalysis.ml_estimated_age - current.witness_age).toFixed(1)}`}</b></span></div>}<div className="mt-4 grid gap-2 text-sm sm:grid-cols-2"><span>Model: <b className="text-[var(--ink)]">INT8 ResNet50 + FP32 Age Head</b></span><span>Training domain: <b className="text-[var(--ink)]">{currentAgeAnalysis.training_domain}</b></span></div></div>}{currentAgeAnalysis && <p className="mt-4 border-t border-[var(--line)] pt-3 text-xs leading-5">Exploratory analysis of this generated sketch. The model was evaluated on AgeDB photographs, so its photo-domain accuracy does not establish accuracy on police sketches.</p>}</div></div>}
-        {analysis && <div className="mt-6 border-t border-[var(--line)] pt-4"><p className="label">ML Analysis</p><div className="mt-3 grid grid-cols-2 gap-3 text-sm text-[var(--muted)]"><span>Model: <b className="text-[var(--ink)]">ResNet-50</b></span><span>Device: <b className="text-[var(--ink)]">{analysis.device.toUpperCase()}</b></span><span>Embedding dimension: <b className="text-[var(--ink)]">{analysis.embedding_dimension}</b></span><span>Inference time: <b className="text-[var(--ink)]">{analysis.inference_time_ms} ms</b></span></div><button type="button" onClick={runBenchmark} disabled={Boolean(busy)} className="mt-4 border border-[var(--ink)] px-4 py-2 text-xs font-bold uppercase tracking-[0.12em] hover:bg-white disabled:opacity-50">{busy === "benchmark" ? "Running..." : "Run Benchmark"}</button>{benchmark && <div className="mt-4 border-t border-[var(--line)] pt-4 text-sm text-[var(--muted)]"><p className="font-bold text-[var(--ink)]">PyTorch Baseline</p><div className="mt-2 grid grid-cols-2 gap-2"><span>Mean: {benchmark.mean_latency_ms} ms</span><span>Median: {benchmark.median_latency_ms} ms</span><span>Min: {benchmark.min_latency_ms} ms</span><span>Max: {benchmark.max_latency_ms} ms</span><span>Std Dev: {benchmark.std_latency_ms} ms</span><span>Measured Runs: {benchmark.measured_runs}</span><span>Warm-up Runs: {benchmark.warmup_runs}</span><span>Device: {benchmark.device.toUpperCase()}</span></div></div>}</div>}
+
       </section>
     </div>
     {history.length > 1 && <section className="border-t border-[var(--line)] pt-7"><p className="label">Refinement ML Analysis</p><h2 className="section-title mb-5">Visual Feature Similarity</h2><div className="space-y-4">{history.slice(1).map((item, index) => { const previous = history[index]; const key = `${item.id}:${previous.version}-${item.version}`; const result = comparisons[key]; return <div key={key} className="border border-[var(--line)] p-4"><div className="flex items-center justify-between"><span className="text-sm font-bold">V{previous.version} → V{item.version}</span><button type="button" onClick={() => compareVersions(item.id, previous.version, item.version)} disabled={Boolean(busy)} className="border border-[var(--ink)] px-3 py-2 text-xs font-bold uppercase tracking-[0.1em] hover:bg-white disabled:opacity-50">{busy === "compare" ? "Comparing..." : "Compare"}</button></div>{result && <div className="mt-3 grid grid-cols-2 gap-2 text-sm text-[var(--muted)]"><span>Cosine Similarity: <b className="text-[var(--ink)]">{result.cosine_similarity.toFixed(4)}</b></span><span>Cosine Distance: <b className="text-[var(--ink)]">{result.cosine_distance.toFixed(4)}</b></span><span>Model: {result.model}</span><span>Embedding: {result.embedding_dimension}-D</span><span className="col-span-2">Instruction: {result.refinement_instruction || "Not available in saved metadata"}</span></div>}</div>; })}</div></section>}

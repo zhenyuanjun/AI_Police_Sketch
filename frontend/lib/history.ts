@@ -17,12 +17,11 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function normalizeSketch(value: unknown): HistorySketch | null {
   if (!isObject(value) || typeof value.id !== "string" || !value.id ||
       !Number.isInteger(value.version) || Number(value.version) < 1 ||
-      typeof value.description !== "string" ||
       !(typeof value.image_url === "string" || value.image_url === null)) return null;
   return {
     id: value.id,
     version: Number(value.version),
-    description: value.description,
+    description: typeof value.description === "string" ? value.description : "",
     refinement_instruction: typeof value.refinement_instruction === "string" ? value.refinement_instruction : null,
     image_url: value.image_url,
     status: typeof value.status === "string" ? value.status : "saved",
@@ -106,7 +105,22 @@ export function mergeHistory(...groups: HistorySketch[][]): HistorySketch[] {
       });
     }
   }
-  return Array.from(merged.values()).sort((a, b) => {
+  const bySession = new Map<string, HistorySketch[]>();
+  for (const sketch of Array.from(merged.values())) {
+    const versions = bySession.get(sketch.id) || [];
+    versions.push(sketch);
+    bySession.set(sketch.id, versions);
+  }
+  const normalized = Array.from(bySession.values()).flatMap((versions) => {
+    const ordered = versions.sort((a, b) => a.version - b.version);
+    const originalPrompt = ordered.find((item) => item.version === 1 && item.description.trim() && item.description !== "Saved sketch")?.description
+      || ordered.find((item) => item.description.trim() && item.description !== "Saved sketch")?.description
+      || "";
+    const witnessAge = ordered.find((item) => item.version === 1 && item.witness_age != null)?.witness_age
+      ?? ordered.find((item) => item.witness_age != null)?.witness_age ?? null;
+    return ordered.map((item) => ({ ...item, description: originalPrompt, witness_age: witnessAge }));
+  });
+  return normalized.sort((a, b) => {
     const dateOrder = (a.created_at || "").localeCompare(b.created_at || "");
     return dateOrder || a.id.localeCompare(b.id) || a.version - b.version;
   });
@@ -114,5 +128,19 @@ export function mergeHistory(...groups: HistorySketch[][]): HistorySketch[] {
 
 export function historyForSketch(sketches: HistorySketch[], sketchId: string): HistorySketch[] {
   return sketches.filter((sketch) => sketch.id === sketchId).sort((a, b) => a.version - b.version);
+}
+
+export function historySessions(sketches: HistorySketch[]): Array<{ id: string; updated_at: string; versions: HistorySketch[] }> {
+  const sessions = new Map<string, HistorySketch[]>();
+  for (const sketch of mergeHistory([], sketches)) {
+    const versions = sessions.get(sketch.id) || [];
+    versions.push(sketch);
+    sessions.set(sketch.id, versions);
+  }
+  return Array.from(sessions, ([id, versions]) => ({
+    id,
+    updated_at: versions.reduce((latest, item) => (item.created_at || "") > latest ? item.created_at || "" : latest, ""),
+    versions: versions.sort((a, b) => a.version - b.version),
+  })).sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id));
 }
 
