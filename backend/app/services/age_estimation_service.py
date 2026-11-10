@@ -41,6 +41,7 @@ EXPECTED_OUTPUT_SCALE = 0.021488072350621223
 EXPECTED_OUTPUT_ZERO_POINT = -128
 TRAINING_AGE_MIN, TRAINING_AGE_MAX = 1.0, 101.0
 MODEL_IDENTIFIER = "agedb-resnet50-w8a8-backbone-fp32-age-head"
+FEATURE_MODEL_IDENTIFIER = "resnet50-int8-imagenet1k-v2"
 TRAINING_EVALUATION_DOMAIN = "AgeDB photographs"
 APPLICATION_INTERPRETATION = "exploratory sketch-domain signal"
 
@@ -231,7 +232,8 @@ class AgeEstimationService:
             raise InvalidImageError("Canonical preprocessing produced an invalid input tensor")
         return prepared
 
-    def estimate_from_image_bytes(self, image_bytes: bytes) -> AgeEstimationResult:
+    def extract_features_from_image_bytes(self, image_bytes: bytes) -> np.ndarray:
+        """Return the dequantized 2048-D pooled ResNet50 backbone features."""
         prepared = self._prepare_input(image_bytes)
         quantized = np.clip(
             np.rint(prepared / self._input_scale + self._input_zero_point), -128, 127
@@ -240,7 +242,9 @@ class AgeEstimationService:
             with self._interpreter_lock:
                 self._interpreter.set_tensor(self._input_detail["index"], quantized)
                 self._interpreter.invoke()
-                raw_feature = np.asarray(self._interpreter.get_tensor(self._output_detail["index"])).copy()
+                raw_feature = np.asarray(
+                    self._interpreter.get_tensor(self._output_detail["index"])
+                ).copy()
         except Exception as exc:
             raise BackboneInferenceError("Finalized INT8 LiteRT backbone inference failed") from exc
         if raw_feature.shape != EXPECTED_OUTPUT_SHAPE or raw_feature.dtype != np.int8:
@@ -248,6 +252,24 @@ class AgeEstimationService:
         dequantized = (raw_feature.astype(np.float32) - self._output_zero_point) * self._output_scale
         if not np.isfinite(dequantized).all():
             raise BackboneInferenceError("LiteRT backbone dequantization produced non-finite features")
+        return dequantized[0].copy()
+
+    def compare_image_features(self, image_a: bytes, image_b: bytes) -> dict[str, float | int | str]:
+        """Compare the shared 2048-D ImageNet ResNet50 pooled features by cosine similarity."""
+        feature_a = self.extract_features_from_image_bytes(image_a)
+        feature_b = self.extract_features_from_image_bytes(image_b)
+        norm_a = max(float(np.linalg.norm(feature_a)), 1e-8)
+        norm_b = max(float(np.linalg.norm(feature_b)), 1e-8)
+        similarity = float(np.clip(np.dot(feature_a, feature_b) / (norm_a * norm_b), -1.0, 1.0))
+        return {
+            "model": FEATURE_MODEL_IDENTIFIER,
+            "embedding_dimension": int(feature_a.shape[0]),
+            "cosine_similarity": round(similarity, 4),
+            "cosine_distance": round(1.0 - similarity, 4),
+        }
+
+    def estimate_from_image_bytes(self, image_bytes: bytes) -> AgeEstimationResult:
+        dequantized = self.extract_features_from_image_bytes(image_bytes)[np.newaxis, :]
         try:
             hidden = dequantized @ self._head["linear1_weight"].T
             hidden = np.maximum(hidden + self._head["linear1_bias"], np.float32(0.0))
@@ -267,7 +289,7 @@ class AgeEstimationService:
             age_head_artifact_hash=self.age_head_artifact_hash,
             training_evaluation_domain=TRAINING_EVALUATION_DOMAIN,
             application_interpretation=APPLICATION_INTERPRETATION,
-            preprocessing_shape=tuple(prepared.shape),
-            raw_int8_feature_shape=tuple(raw_feature.shape),
+            preprocessing_shape=EXPECTED_INPUT_SHAPE,
+            raw_int8_feature_shape=EXPECTED_OUTPUT_SHAPE,
             dequantized_feature_shape=tuple(dequantized.shape),
         )

@@ -24,7 +24,9 @@ cd backend
 .venv-age-int8/bin/python experiments/age_regression/validate_numpy_age_head.py
 ```
 
-The optional `FaceAnalysisService` still uses PyTorch and torchvision and remains lazy-loaded. Its routes return HTTP 503 with an install instruction when those optional dependencies are absent. To install them, use `pip install -r requirements-face-analysis.txt` in addition to the standard requirements. The experiment requirements and lock files remain unchanged.
+Visual version comparison reuses the production INT8 LiteRT ResNet50 backbone and compares its dequantized 2048-D pooled features with cosine similarity. The backbone uses the same frozen `ResNet50_Weights.IMAGENET1K_V2` weights and canonical preprocessing as the original FP32 comparison extractor. The quantization validation report measured mean cosine similarity 0.988 between FP32 and INT8 features on its 50-image validation sample. This avoids adding PyTorch and torchvision to the production comparison path while retaining the same feature representation up to the measured INT8 approximation.
+
+The separate optional `FaceAnalysisService` still uses PyTorch and torchvision and remains lazy-loaded for the `/analyze` and `/benchmark` routes. Those routes return HTTP 503 when the optional dependencies are absent. To install them for those routes, use `pip install -r requirements-face-analysis.txt` in addition to the standard requirements. The experiment requirements and lock files remain unchanged.
 
 ## Locked artifact hashes
 

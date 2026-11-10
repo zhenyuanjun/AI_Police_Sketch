@@ -77,8 +77,11 @@ def get_age_estimation_service():
 
                 try:
                     age_estimation_service = AgeEstimationService()
-                except Exception:
-                    logger.exception("Age estimation service is unavailable.")
+                except Exception as exc:
+                    logger.exception(
+                        "Age estimation service is unavailable: exception_class=%s error_message=%s",
+                        type(exc).__name__, str(exc),
+                    )
     return age_estimation_service
 
 
@@ -127,17 +130,65 @@ def compare_sketch_versions(
     version_a: int = Query(ge=1),
     version_b: int = Query(ge=1),
 ) -> SketchComparisonResponse:
-    image_a = image_storage.load_version(sketch_id, version_a)
-    image_b = image_storage.load_version(sketch_id, version_b)
-    if image_a is None or image_b is None:
-        raise HTTPException(status_code=404, detail="One or both sketch versions were not found.")
+    from app.services.age_estimation_service import AgeEstimationError, InvalidImageError
+
+    stage = "version_image_lookup"
     try:
-        result = get_analysis_service().compare(image_a, image_b)
-    except FaceAnalysisUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    metadata_b = image_storage.get_version_metadata(sketch_id, version_b) or {}
+        image_a = image_storage.load_version(sketch_id, version_a)
+        image_b = image_storage.load_version(sketch_id, version_b)
+        if image_a is None or image_b is None:
+            logger.warning(
+                "Sketch comparison source image missing: stage=%s sketch_id=%s "
+                "version_a=%s version_b=%s image_a_available=%s image_b_available=%s "
+                "storage_backend=%s",
+                stage, sketch_id, version_a, version_b, image_a is not None,
+                image_b is not None, type(image_storage).__name__,
+            )
+            raise HTTPException(status_code=404, detail="One or both sketch versions were not found.")
+        logger.info(
+            "Sketch comparison source images loaded: sketch_id=%s version_a=%s version_b=%s "
+            "image_a_size_bytes=%s image_b_size_bytes=%s storage_backend=%s",
+            sketch_id, version_a, version_b, len(image_a), len(image_b),
+            type(image_storage).__name__,
+        )
+
+        stage = "feature_model_loading"
+        estimator = get_age_estimation_service()
+        if estimator is None:
+            logger.error(
+                "Sketch comparison model unavailable: stage=%s sketch_id=%s version_a=%s version_b=%s",
+                stage, sketch_id, version_a, version_b,
+            )
+            raise HTTPException(status_code=503, detail="Visual feature comparison is unavailable.")
+
+        stage = "feature_extraction_and_similarity"
+        result = estimator.compare_image_features(image_a, image_b)
+
+        stage = "version_metadata_lookup"
+        metadata_b = image_storage.get_version_metadata(sketch_id, version_b) or {}
+    except HTTPException:
+        raise
+    except InvalidImageError as exc:
+        logger.exception(
+            "Sketch comparison failed: stage=%s sketch_id=%s version_a=%s version_b=%s "
+            "exception_class=%s error_message=%s",
+            stage, sketch_id, version_a, version_b, type(exc).__name__, str(exc),
+        )
+        raise HTTPException(status_code=422, detail="One or both saved sketch images are invalid.") from exc
+    except AgeEstimationError as exc:
+        logger.exception(
+            "Sketch comparison failed: stage=%s sketch_id=%s version_a=%s version_b=%s "
+            "exception_class=%s error_message=%s",
+            stage, sketch_id, version_a, version_b, type(exc).__name__, str(exc),
+        )
+        raise HTTPException(status_code=503, detail="Visual feature comparison is unavailable.") from exc
+    except Exception as exc:
+        logger.exception(
+            "Sketch comparison failed: stage=%s sketch_id=%s version_a=%s version_b=%s "
+            "exception_class=%s error_message=%s",
+            stage, sketch_id, version_a, version_b, type(exc).__name__, str(exc),
+        )
+        raise HTTPException(status_code=500, detail="Sketch comparison failed.") from exc
     return SketchComparisonResponse(
         sketch_id=sketch_id,
         version_a=version_a,
